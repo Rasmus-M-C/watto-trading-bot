@@ -5,7 +5,7 @@ const GQL_ENDPOINT  = 'https://f2026-bagende.itmindsinternal.dk//graphql';
 const BUY_BELOW     = 0.93;
 const SELL_ABOVE    = 1.23;
 const TICK_INTERVAL = 1 * 60 * 1000;  // check every 1 minute
-const WAIT_DELAY = 20;
+const WAIT_DELAY = 50;
 const EMAIL    = process.env.WATTO_USER;
 const PASSWORD = process.env.WATTO_PASS;
 
