@@ -23,7 +23,10 @@ const ITEMS_BY_CATEGORY = {
     'ce665896-47b1-45ad-a0ca-ed81f1b8c11a',  // NAV NAV
   ],
   'Podracer Parts': [
-    '35b70839-b24d-4985-b719-463fe281e053',  // PODRACER POD
+    '35b70839-b24d-4985-b719-463fe281e053',  // IGNITION POD
+    'cb4f4ffb-d24f-44ed-b23f-b0c88f944e38',  // IGNITION POD
+    '4fd24482-26ff-49cc-ae9c-ecf9e18b33f4',  // IGNITION POD
+
   ],
   'Misc Junk': [
     'ad9906f8-6e4f-4210-9288-0bb5edb6d4ff',  // HELMET
