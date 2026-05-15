@@ -1,0 +1,12 @@
+{
+  "name": "watto-bot",
+  "version": "1.0.0",
+  "description": "Automated trading bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
