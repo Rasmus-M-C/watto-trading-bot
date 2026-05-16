@@ -32,10 +32,10 @@ const ITEMS_BY_CATEGORY = {
     '54a19bae-d195-4395-be0f-b881a7e3eedd',  // INT-CHAIR
   ],
   'Droids': [
-    'd06e0479-bc0e-4615-9918-96f41fe61a18',  // PARTS
-    '5d426e2e-f908-4a79-855f-023a123e24fd',  // LEG
+    '79b082c0-854c-4da2-97d7-562d539c98c9',  // PARTS
+    '2438b62e-2a52-43f0-a5fe-ac9c33935f77',  // LEG
     '1c575d71-c080-42fa-9a3d-8ed8523311ed',  // GONK
-    '52f60276-2f8a-4701-a7b7-88e494d6534d',  // HEAD
+    '0cd73b63-fc10-483f-be8c-29357860406b',  // HEAD
   ],
   'Rare Artifacts': [
     'ecbd757f-db77-4ce6-b738-ee3f30042234', //SITH
