@@ -2,11 +2,10 @@ const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const GQL_ENDPOINT  = 'https://f2026-bagende.itmindsinternal.dk/graphql';
-const BUY_BELOW     = 0.80;
-const SELL_ABOVE    = 1.20;
-const TOKEN_REFRESH = 5 * 60 * 1000;
+const BUY_BELOW     = 0.93;
+const SELL_ABOVE    = 1.23;
+const TOKEN_REFRESH = 20 * 60 * 1000;
 
-// Worker accounts — set via env: WORKER_1=email:password WORKER_2=email:password etc.
 const WORKER_CREDENTIALS = [];
 for (let i = 1; i <= 10; i++) {
   const val = process.env[`WORKER_${i}`];
@@ -19,14 +18,8 @@ for (let i = 1; i <= 10; i++) {
 const MAIN_EMAIL    = process.env.WATTO_USER;
 const MAIN_PASSWORD = process.env.WATTO_PASS;
 
-if (!MAIN_EMAIL || !MAIN_PASSWORD) {
-  console.error('Missing WATTO_USER or WATTO_PASS');
-  process.exit(1);
-}
-if (!WORKER_CREDENTIALS.length) {
-  console.error('No worker accounts found. Set WORKER_1=email:password etc.');
-  process.exit(1);
-}
+if (!MAIN_EMAIL || !MAIN_PASSWORD) { console.error('Missing WATTO_USER or WATTO_PASS'); process.exit(1); }
+if (!WORKER_CREDENTIALS.length)    { console.error('No workers found. Set WORKER_1=email:password'); process.exit(1); }
 
 // ─── Item registry ────────────────────────────────────────────────────────────
 const ITEMS_BY_CATEGORY = {
@@ -58,15 +51,12 @@ const ITEMS_BY_CATEGORY = {
 };
 
 // ─── Shared bus ───────────────────────────────────────────────────────────────
-// Workers push listing IDs here; main account drains and buys them
 const bus = {
-  listings: [],  // { listingId, itemId, unitPrice, quantity, postedBy }
-
+  listings: [],
   post(listing) {
     this.listings.push(listing);
     console.log(`  [bus] ${listing.postedBy} → listingId=${listing.listingId} qty=${listing.quantity} @ ${listing.unitPrice}`);
   },
-
   drain() {
     const all = [...this.listings];
     this.listings = [];
@@ -90,10 +80,7 @@ async function gqlAs(token, query, variables = {}) {
 async function doRefreshToken(token) {
   const res = await fetch(GQL_ENDPOINT, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Cookie':       `refresh_token=${token}`,
-    },
+    headers: { 'Content-Type': 'application/json', 'Cookie': `refresh_token=${token}` },
     body: JSON.stringify({ query: 'mutation { refreshToken }' }),
   });
   const data = await res.json();
@@ -120,7 +107,30 @@ async function getItemTypes(token) {
   return data?.data?.itemTypes ?? [];
 }
 
-// ─── Worker: buy cheap items and list on market, post listing ID to bus ───────
+// Safe interval wrapper — logs errors but never dies
+function safeInterval(label, fn, ms) {
+  const run = async () => {
+    try {
+      await fn();
+    } catch (err) {
+      console.error(`[${label}] interval error:`, err.message);
+    }
+  };
+  setInterval(run, ms);
+}
+
+// Safe timeout wrapper
+function safeTimeout(label, fn, ms) {
+  setTimeout(async () => {
+    try {
+      await fn();
+    } catch (err) {
+      console.error(`[${label}] timeout error:`, err.message);
+    }
+  }, ms);
+}
+
+// ─── Worker ───────────────────────────────────────────────────────────────────
 async function runWorker({ email, password, name }) {
   console.log(`[${name}] Logging in...`);
   const loginData = await loginAs(email, password);
@@ -129,112 +139,104 @@ async function runWorker({ email, password, name }) {
   let token = loginData.token;
   console.log(`[${name}] Logged in as "${loginData.name}"`);
 
-  setInterval(async () => {
+  safeInterval(`${name}:refresh`, async () => {
     const t = await doRefreshToken(token);
     if (t) { token = t; console.log(`[${name}] Token refreshed`); }
+    else   { console.warn(`[${name}] Refresh failed, re-logging in...`); const d = await loginAs(email, password); if (d?.token) token = d.token; }
   }, TOKEN_REFRESH);
 
-  // Buy one item and immediately list it; post listing ID to bus
+  // Buy one item and list it on the market, returns true if stock remains
   async function buyAndList(itemId) {
-    // Buy
     const buyData = await gqlAs(token,
       `mutation BuyItem($itemId: ID!) {
-        buyItem(itemId: $itemId) {
-          id
-          purchasePrice
-          item { id stock }
-        }
+        buyItem(itemId: $itemId) { id purchasePrice item { id stock } }
       }`,
       { itemId }
     );
 
     if (buyData?.errors || !buyData?.data?.buyItem) {
-      const reason = buyData?.errors?.[0]?.message ?? 'unknown';
-      console.log(`  [${name}] buy failed: ${reason} - Buying the item ${itemId}`);
+      console.log(`  [${name}] buy stopped: ${buyData?.errors?.[0]?.message ?? 'unknown'}`);
       return false;
     }
 
     const { purchasePrice, item } = buyData.data.buyItem;
-    console.log(`  [${name}] bought itemId=${item.id} @ ${purchasePrice} (stock left: ${item.stock})`);
+    console.log(`  [${name}] bought @ ${purchasePrice} (stock left: ${item.stock})`);
 
-    // List on market at purchase price + 2% so main account still profits
     const unitPrice = parseFloat((purchasePrice * 1.02).toFixed(4));
-
-    const listData = await gqlAs(token,
+    const listData  = await gqlAs(token,
       `mutation CreateMarketListing($itemId: ID!, $quantity: Int!, $unitPrice: Float!) {
         createMarketListing(itemId: $itemId, quantity: $quantity, unitPrice: $unitPrice) {
-          id
-          unitPrice
-          quantityTotal
+          id unitPrice quantityTotal
         }
       }`,
       { itemId: item.id, quantity: 1, unitPrice }
     );
 
     if (listData?.errors || !listData?.data?.createMarketListing) {
-      console.log(`  [${name}] listing failed:`, listData?.errors?.[0]?.message ?? 'unknown');
+      console.log(`  [${name}] listing failed: ${listData?.errors?.[0]?.message ?? 'unknown'}`);
       return false;
     }
 
     const listing = listData.data.createMarketListing;
-    bus.post({
-      listingId: listing.id,
-      itemId:    item.id,
-      unitPrice: listing.unitPrice,
-      quantity:  listing.quantityTotal,
-      postedBy:  name,
-    });
+    bus.post({ listingId: listing.id, itemId: item.id, unitPrice: listing.unitPrice, quantity: listing.quantityTotal, postedBy: name });
 
     return item.stock > 0;
   }
 
-  // Drain all current stock for cheap categories
+  // Drain all stock for categories currently below threshold
   async function drainAndList() {
     const itemTypes = await getItemTypes(token);
+    let acted = false;
 
     for (const itemType of itemTypes) {
       const weight = parseFloat(itemType.weight);
       const items  = ITEMS_BY_CATEGORY[itemType.name];
       if (!items || weight >= BUY_BELOW) continue;
 
-      console.log(`[${name}] ${itemType.name} @ ${weight} -> draining stock`);
+      console.log(`[${name}] ${itemType.name} @ ${weight} -> draining`);
+      acted = true;
       for (const itemId of items) {
-        let stockLeft = true;
-        while (stockLeft) {
-          stockLeft = await buyAndList(itemId);
-        }
+        let hasMore = true;
+        while (hasMore) hasMore = await buyAndList(itemId);
       }
     }
+
+    if (!acted) console.log(`[${name}] price check — nothing below ${BUY_BELOW}, holding`);
   }
 
-  // Run immediately, then sync to :11 each minute
-  await drainAndList();
+  // Run immediately
+  await drainAndList().catch(err => console.error(`[${name}] initial drain error:`, err.message));
 
+  // Align to :11 each minute, then every 60s
   const now    = new Date();
   const secs   = now.getSeconds();
   const ms     = now.getMilliseconds();
   const waitMs = secs < 11 ? (11 - secs) * 1000 - ms : (71 - secs) * 1000 - ms;
-  console.log(`[${name}] Next price check in ${(waitMs / 1000).toFixed(1)}s`);
-  setTimeout(async () => {
+  console.log(`[${name}] Aligned price check in ${(waitMs / 1000).toFixed(1)}s`);
+
+  safeTimeout(`${name}:align`, async () => {
     await drainAndList();
-    setInterval(drainAndList, 60 * 1000);
+    safeInterval(`${name}:drain`, drainAndList, 60 * 1000);
   }, waitMs);
 
   // Restock loop — try to grab 1 of each cheap item every 10s
-  setInterval(async () => {
+  safeInterval(`${name}:restock`, async () => {
     const itemTypes = await getItemTypes(token);
+    let acted = false;
+
     for (const itemType of itemTypes) {
       if (parseFloat(itemType.weight) >= BUY_BELOW) continue;
       const items = ITEMS_BY_CATEGORY[itemType.name];
       if (!items) continue;
-      for (const itemId of items) {
-        await buyAndList(itemId);
-      }
+      acted = true;
+      for (const itemId of items) await buyAndList(itemId);
     }
+
+    if (!acted) console.log(`[${name}] restock: nothing to buy`);
   }, 10 * 1000);
 }
 
-// ─── Main account: buy from bus, sell to Watto when price is high ─────────────
+// ─── Main account ─────────────────────────────────────────────────────────────
 async function runMain() {
   console.log('[Main] Logging in...');
   const loginData = await loginAs(MAIN_EMAIL, MAIN_PASSWORD);
@@ -243,18 +245,21 @@ async function runMain() {
   let token = loginData.token;
   console.log('[Main] Logged in as', loginData.name);
 
-  setInterval(async () => {
+  safeInterval('Main:refresh', async () => {
     const t = await doRefreshToken(token);
     if (t) { token = t; console.log('[Main] Token refreshed'); }
+    else   { console.warn('[Main] Refresh failed, re-logging in...'); const d = await loginAs(MAIN_EMAIL, MAIN_PASSWORD); if (d?.token) token = d.token; }
   }, TOKEN_REFRESH);
 
-  // Items bought from workers but not yet sold — { itemId, quantity }
+  // Track items bought from workers
   const inventory = [];
 
-  // Every 2s: buy any listings posted by workers
-  setInterval(async () => {
+  // Every 2s: drain bus and buy worker listings
+  safeInterval('Main:buy', async () => {
     const listings = bus.drain();
     if (!listings.length) return;
+
+    console.log(`[Main] ${listings.length} listing(s) on bus`);
 
     for (const listing of listings) {
       console.log(`[Main] Buying listing ${listing.listingId} x${listing.quantity} @ ${listing.unitPrice}`);
@@ -262,35 +267,28 @@ async function runMain() {
       const buyData = await gqlAs(token,
         `mutation BuyMarketListing($listingId: ID!, $quantity: Int!) {
           buyMarketListing(listingId: $listingId, quantity: $quantity) {
-            listingId
-            totalCost
-            quantityBought
-            quantityRemaining
+            listingId totalCost quantityBought quantityRemaining
           }
         }`,
         { listingId: listing.listingId, quantity: listing.quantity }
       );
 
       if (buyData?.errors || !buyData?.data?.buyMarketListing) {
-        console.log(`[Main] Buy failed:`, buyData?.errors?.[0]?.message ?? 'unknown');
+        console.log(`[Main] Buy failed: ${buyData?.errors?.[0]?.message ?? 'unknown'}`);
         continue;
       }
 
       const result = buyData.data.buyMarketListing;
       console.log(`[Main] Bought x${result.quantityBought} total cost: ${result.totalCost}`);
 
-      // Add to inventory
       const existing = inventory.find(i => i.itemId === listing.itemId);
-      if (existing) {
-        existing.quantity += result.quantityBought;
-      } else {
-        inventory.push({ itemId: listing.itemId, quantity: result.quantityBought });
-      }
+      if (existing) existing.quantity += result.quantityBought;
+      else inventory.push({ itemId: listing.itemId, quantity: result.quantityBought });
     }
   }, 2 * 1000);
 
-  // Every 15s: check prices and sell inventory to Watto if profitable
-  setInterval(async () => {
+  // Every 15s: sell inventory to Watto if price is high
+  safeInterval('Main:sell', async () => {
     if (!inventory.length) return;
 
     const itemTypes = await getItemTypes(token);
@@ -299,33 +297,30 @@ async function runMain() {
       const weight = parseFloat(itemType.weight);
       if (weight <= SELL_ABOVE) continue;
 
-      // Find inventory items that belong to this category
       const categoryItemIds = ITEMS_BY_CATEGORY[itemType.name] ?? [];
+      const toSell = inventory.filter(i => categoryItemIds.includes(i.itemId) && i.quantity > 0);
+      if (!toSell.length) continue;
 
-      for (const { itemId } of inventory.filter(i => categoryItemIds.includes(i.itemId))) {
-        const inv = inventory.find(i => i.itemId === itemId);
-        if (!inv || inv.quantity === 0) continue;
+      console.log(`[Main] ${itemType.name} @ ${weight} -> selling inventory to Watto`);
 
-        console.log(`[Main] ${itemType.name} @ ${weight} -> selling ${inv.quantity} to Watto`);
-
+      for (const inv of toSell) {
         while (inv.quantity > 0) {
           const sellData = await gqlAs(token,
             `mutation SellItem($itemId: ID!, $quantity: Int!, $sellTo: SellTarget!) {
               sellItem(itemId: $itemId, quantity: $quantity, sellTo: $sellTo) {
-                payout
-                newItemStock
+                payout newItemStock
               }
             }`,
-            { itemId, quantity: 1, sellTo: 'WATTO' }
+            { itemId: inv.itemId, quantity: 1, sellTo: 'WATTO' }
           );
 
           if (sellData?.errors || !sellData?.data?.sellItem) {
-            console.log(`[Main] Sell failed:`, sellData?.errors?.[0]?.message ?? 'unknown');
+            console.log(`[Main] Sell failed: ${sellData?.errors?.[0]?.message ?? 'unknown'}`);
             break;
           }
 
           inv.quantity--;
-          console.log(`[Main] Sold to Watto, payout: ${sellData.data.sellItem.payout} (${inv.quantity} left in inventory)`);
+          console.log(`[Main] Sold to Watto payout: ${sellData.data.sellItem.payout} (${inv.quantity} left)`);
         }
       }
     }
