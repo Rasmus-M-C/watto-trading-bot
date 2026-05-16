@@ -150,7 +150,7 @@ async function runWorker({ email, password, name }) {
 
     if (buyData?.errors || !buyData?.data?.buyItem) {
       const reason = buyData?.errors?.[0]?.message ?? 'unknown';
-      console.log(`  [${name}] buy failed: ${reason}`);
+      console.log(`  [${name}] buy failed: ${reason} - Buying the item ${itemId}`);
       return false;
     }
 
