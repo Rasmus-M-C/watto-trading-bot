@@ -1,7 +1,7 @@
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const GQL_ENDPOINT    = 'https://f2026-backend.itmindsinternal.dk/graphql';
+const GQL_ENDPOINT    = 'https://f2026-bagende.itmindsinternal.dk/graphql';
 const BUY_BELOW       = 0.80;
 const SELL_ABOVE      = 1.20;
 const TOKEN_REFRESH   = 20 * 60 * 1000;  // refresh bearer every 20 minutes
