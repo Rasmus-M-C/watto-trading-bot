@@ -30,8 +30,7 @@ if (!EMAIL || !PASSWORD) {
 
 // ─── Skip list — item IDs to never buy ───────────────────────────────────────
 const SKIP_ITEM_IDS = new Set([
-  // Add IDs here to skip buying them, e.g:
-  // '23c9ae29-7795-4bd1-8782-6c36893a28c1',
+  '695e6e0d-03b4-4812-94b5-411e88a81a22'
 ]);
 
 // ─── State ────────────────────────────────────────────────────────────────────
