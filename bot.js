@@ -6,7 +6,9 @@ const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args
 const args         = process.argv.slice(2);
 const offsetFlag   = args.indexOf('--offset');
 const SECOND_OFFSET = offsetFlag !== -1 ? parseInt(args[offsetFlag + 1], 10) : 11;
-
+const SKIP_ITEM_IDS = new Set([
+  '695e6e0d-03b4-4812-94b5-411e88a81a22',  // Ancient Jedi Texts
+]);
 if (isNaN(SECOND_OFFSET) || SECOND_OFFSET < 0 || SECOND_OFFSET > 59) {
   console.error('Invalid --offset value. Must be 0-59.');
   process.exit(1);
@@ -127,9 +129,9 @@ async function buyOne(itemId, itemName) {
 
 // ─── Buy all available stock of an item ───────────────────────────────────────
 async function buyAllStock(item) {
-  const { id, name, stock } = item;
-  if (id === "695e6e0d-03b4-4812-94b5-411e88a81a22") {
-    continue;
+  if (SKIP_ITEM_IDS.has(item.id)) {
+    console.log(`    [buy] ${item.name}: skipped`);
+    return;
   }
   if (stock === 0) { console.log(`    [buy] ${name}: no stock`); return; }
 
