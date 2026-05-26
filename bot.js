@@ -1,55 +1,40 @@
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
+// ─── CLI args ─────────────────────────────────────────────────────────────────
+// Usage: node bot.js --offset 11
+// --offset N  : seconds past each minute to run the price check (default: 11)
+const args         = process.argv.slice(2);
+const offsetFlag   = args.indexOf('--offset');
+const SECOND_OFFSET = offsetFlag !== -1 ? parseInt(args[offsetFlag + 1], 10) : 11;
+
+if (isNaN(SECOND_OFFSET) || SECOND_OFFSET < 0 || SECOND_OFFSET > 59) {
+  console.error('Invalid --offset value. Must be 0-59.');
+  process.exit(1);
+}
+
+console.log(`[Config] Price check offset: :${String(SECOND_OFFSET).padStart(2, '0')} past each minute`);
+
 // ─── Config ───────────────────────────────────────────────────────────────────
-const GQL_ENDPOINT    = 'https://f2026-bagende.itmindsinternal.dk/graphql';
-const BUY_BELOW       = 0.80;
-const SELL_ABOVE      = 1.20;
-const TOKEN_REFRESH   = 20 * 60 * 1000;  // refresh bearer every 20 minutes
+const GQL_ENDPOINT  = 'https://f2026-bagende.itmindsinternal.dk/graphql';
+const BUY_BELOW     = 0.80;   // buy when priceModifier is below this
+const SELL_ABOVE    = 1.20;   // sell when priceModifier is above this
+const TOKEN_REFRESH = 20 * 60 * 1000;
 
 const EMAIL    = process.env.WATTO_USER;
 const PASSWORD = process.env.WATTO_PASS;
 
 if (!EMAIL || !PASSWORD) {
   console.error('[Bot] Missing WATTO_USER or WATTO_PASS environment variables.');
-  console.error('      Run: WATTO_USER=email WATTO_PASS=pass node bot.js');
+  console.error('      Run: WATTO_USER=email WATTO_PASS=pass node bot.js [--offset N]');
   process.exit(1);
 }
 
-// ─── Item registry ────────────────────────────────────────────────────────────
-const ITEMS_BY_CATEGORY = {
-  'Navigation & Electronics': [
-    '51931257-a8ce-4504-9dbc-b3ea7911bdda',  // HOLOGRAPHIC NAV
-    'ce665896-47b1-45ad-a0ca-ed81f1b8c11a',  // NAV NAV
-  ],
-  'Podracer Parts': [
-    '35b70839-b24d-4985-b719-463fe281e053',  // IGNITION POD
-    'cb4f4ffb-d24f-44ed-b23f-b0c88f944e38',  // IGNITION POD
-    '4fd24482-26ff-49cc-ae9c-ecf9e18b33f4',  // IGNITION POD
-
-  ],
-  'Misc Junk': [
-    'ad9906f8-6e4f-4210-9288-0bb5edb6d4ff',  // HELMET
-    '54a19bae-d195-4395-be0f-b881a7e3eedd',  // INT-CHAIR
-  ],
-  'Droids': [
-    '79b082c0-854c-4da2-97d7-562d539c98c9',  // PARTS
-    '2438b62e-2a52-43f0-a5fe-ac9c33935f77',  // LEG
-    '1c575d71-c080-42fa-9a3d-8ed8523311ed',  // GONK
-    '0cd73b63-fc10-483f-be8c-29357860406b',  // HEAD
-  ],
-  'Rare Artifacts': [
-    'ecbd757f-db77-4ce6-b738-ee3f30042234', //SITH
-    '3751c92d-2397-4894-bb04-1feed04ccbd7', // BESKAR
-    '23c9ae29-7795-4bd1-8782-6c36893a28c1', //ANCIENT
-  ]
-};
-
 // ─── State ────────────────────────────────────────────────────────────────────
-let token          = null;
-let activeBuyItems = [];   // item IDs currently being restocked and bought
-let restockTimer   = null; // interval that retries buys every 10s
+let token        = null;
+let restockTimer = null;
+let restockItems = [];  // items to retry buying every 10s
 
-// ─── GraphQL — normal calls with bearer token ─────────────────────────────────
+// ─── GQL helper ───────────────────────────────────────────────────────────────
 async function gql(query, variables = {}) {
   const res = await fetch(GQL_ENDPOINT, {
     method: 'POST',
@@ -62,31 +47,7 @@ async function gql(query, variables = {}) {
   return res.json();
 }
 
-// ─── Auth: refresh token ──────────────────────────────────────────────────────
-async function refreshBearer() {
-  console.log('[Auth] Refreshing token...');
-  const res = await fetch(GQL_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Cookie':       `refresh_token=${token}`,
-    },
-    body: JSON.stringify({ query: 'mutation { refreshToken }' }),
-  });
-
-  const data = await res.json();
-  const newToken = data?.data?.refreshToken;
-
-  if (newToken) {
-    token = newToken;
-    console.log('[Auth] Token refreshed');
-  } else {
-    console.warn('[Auth] Refresh failed, re-logging in...');
-    await login();
-  }
-}
-
-// ─── Auth: full login ─────────────────────────────────────────────────────────
+// ─── Auth ─────────────────────────────────────────────────────────────────────
 async function login() {
   console.log('[Auth] Logging in as', EMAIL);
   const res = await fetch(GQL_ENDPOINT, {
@@ -94,45 +55,55 @@ async function login() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       query: `mutation Login($email: String!, $password: String!) {
-        login(email: $email, password: $password) {
-          id
-          email
-          token
-          name
-        }
+        login(email: $email, password: $password) { id email token name }
       }`,
       variables: { email: EMAIL, password: PASSWORD },
     }),
   });
-
   const data = await res.json();
   const t = data?.data?.login?.token;
-
-  if (!t) {
-    console.error('[Auth] Login failed:', JSON.stringify(data?.errors ?? data));
-    process.exit(1);
-  }
-
+  if (!t) { console.error('[Auth] Login failed:', JSON.stringify(data?.errors ?? data)); process.exit(1); }
   token = t;
   console.log('[Auth] Logged in as', data.data.login.name);
 }
 
-// ─── Get item type weights ────────────────────────────────────────────────────
-async function getItemTypes() {
+async function refreshBearer() {
+  console.log('[Auth] Refreshing token...');
+  const res = await fetch(GQL_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Cookie': `refresh_token=${token}` },
+    body: JSON.stringify({ query: 'mutation { refreshToken }' }),
+  });
+  const data = await res.json();
+  const newToken = data?.data?.refreshToken;
+  if (newToken) { token = newToken; console.log('[Auth] Token refreshed'); }
+  else          { console.warn('[Auth] Refresh failed, re-logging in...'); await login(); }
+}
+
+// ─── Fetch all shop items with current prices and stock ───────────────────────
+async function getShopItems() {
   const data = await gql(`
-    query ItemTypes {
-      itemTypes {
+    query ShopItems {
+      items {
         id
         name
-        weight
+        basePrice
+        currentPrice
+        stock
+        maxStock
+        type {
+          id
+          name
+          priceModifier
+        }
       }
     }
   `);
-  return data?.data?.itemTypes ?? [];
+  return data?.data?.items ?? [];
 }
 
-// ─── Try to buy one of each active item (one per restock tick) ────────────────
-async function buyOne(itemId, label) {
+// ─── Buy one item (single unit) ───────────────────────────────────────────────
+async function buyOne(itemId, itemName) {
   const data = await gql(
     `mutation BuyItem($itemId: ID!) {
       buyItem(itemId: $itemId) {
@@ -145,17 +116,31 @@ async function buyOne(itemId, label) {
   );
 
   if (data?.errors || !data?.data?.buyItem) {
-    const reason = data?.errors?.[0]?.message ?? 'unknown error';
-    console.log(`  [restock] ${label}: ${reason}`);
+    console.log(`    [buy] ${itemName}: ${data?.errors?.[0]?.message ?? 'unknown error'}`);
     return false;
   }
 
   const { purchasePrice, item } = data.data.buyItem;
-  console.log(`  [restock] bought ${label} @ ${purchasePrice} (stock left: ${item.stock})`);
+  console.log(`    [buy] ${itemName} @ ${purchasePrice} (stock left: ${item.stock})`);
   return true;
 }
 
-// ─── Sell one item repeatedly until none left ────────────────────────────────
+// ─── Buy all available stock of an item ───────────────────────────────────────
+async function buyAllStock(item) {
+  const { id, name, stock } = item;
+  if (id === "695e6e0d-03b4-4812-94b5-411e88a81a22") {
+    continue;
+  }
+  if (stock === 0) { console.log(`    [buy] ${name}: no stock`); return; }
+
+  console.log(`    [buy] ${name}: buying ${stock} unit(s)`);
+  for (let i = 0; i < stock; i++) {
+    const ok = await buyOne(id, name);
+    if (!ok) break;
+  }
+}
+
+// ─── Sell all of an item ──────────────────────────────────────────────────────
 async function sellUntilEmpty(itemId, itemName) {
   let count = 0;
   while (true) {
@@ -173,141 +158,97 @@ async function sellUntilEmpty(itemId, itemName) {
 
     if (data?.errors || !data?.data?.sellItem) {
       const reason = data?.errors?.[0]?.message ?? 'unknown error';
-      console.log(`    stopped selling ${itemName} after ${count}: ${reason}`);
+      console.log(`    [sell] ${itemName} stopped after ${count}: ${reason}`);
       break;
     }
 
     count++;
     const { payout, newItemStock } = data.data.sellItem;
-    console.log(`    sold ${itemName} #${count} payout: ${payout} (stock left: ${newItemStock})`);
+    console.log(`    [sell] ${itemName} #${count} payout: ${payout} (stock left: ${newItemStock})`);
   }
 }
 
-// ─── Drain all stock of an item on first sight ────────────────────────────────
-async function buyUntilEmpty(itemId, itemName) {
-  let count = 0;
-  while (true) {
-    const data = await gql(
-      `mutation BuyItem($itemId: ID!) {
-        buyItem(itemId: $itemId) {
-          id
-          purchasePrice
-          item { id stock }
-        }
-      }`,
-      { itemId }
-    );
+// ─── Restock loop: fires every 10s, buys 1 of each watched item ──────────────
+function startRestockLoop(items) {
+  if (restockTimer) { clearInterval(restockTimer); restockTimer = null; }
+  if (!items.length) return;
 
-    if (data?.errors || !data?.data?.buyItem) {
-      const reason = data?.errors?.[0]?.message ?? 'unknown error';
-      console.log(`    stopped buying ${itemName} after ${count}: ${reason}`);
-      break;
-    }
-
-    count++;
-    const { purchasePrice, item } = data.data.buyItem;
-    console.log(`    bought ${itemName} #${count} @ ${purchasePrice} (stock left: ${item.stock})`);
-
-    if (item.stock === 0) break;
-  }
-}
-
-// ─── Restock loop: fires every 10s, tries to buy 1 of each active item ───────
-function startRestockLoop(itemsToWatch) {
-  if (restockTimer) {
-    clearInterval(restockTimer);
-    restockTimer = null;
-  }
-
-  if (!itemsToWatch.length) return;
-
-  console.log(`\n[Restock] Watching ${itemsToWatch.length} item(s) — buying every 10s as stock trickles in`);
+  console.log(`\n[Restock] Watching ${items.length} item(s) — retrying every 10s`);
 
   restockTimer = setInterval(async () => {
-    for (const { itemId, label } of itemsToWatch) {
-      await buyOne(itemId, label);
+    for (const item of items) {
+      await buyOne(item.id, item.name);
     }
   }, 10 * 1000);
 }
 
-// ─── Main price check — runs at :15 each minute ──────────────────────────────
+// ─── Main price check tick ────────────────────────────────────────────────────
 async function tick() {
   console.log(`\n[${new Date().toLocaleTimeString()}] Price check...`);
 
-  let itemTypes;
+  let items;
   try {
-    itemTypes = await getItemTypes();
+    items = await getShopItems();
   } catch (err) {
     console.log('  Failed to fetch items:', err.message, '— refreshing token...');
     await refreshBearer();
     return;
   }
 
-  if (!itemTypes.length) {
+  if (!items.length) {
     console.log('  Empty response — refreshing token...');
     await refreshBearer();
     return;
   }
 
-  const newActiveBuyItems = [];
+  // Group items by category and their modifier
+  const byCategory = {};
+  for (const item of items) {
+    const cat = item.type.name;
+    if (!byCategory[cat]) byCategory[cat] = { modifier: item.type.priceModifier, items: [] };
+    byCategory[cat].items.push(item);
+  }
 
-  for (const itemType of itemTypes) {
-    const weight = parseFloat(itemType.weight);
-    const items  = ITEMS_BY_CATEGORY[itemType.name];
+  const newRestockItems = [];
 
-    if (!items) {
-      console.log(`  ${itemType.name}: ${weight} (no items configured)`);
-      continue;
-    }
+  for (const [catName, { modifier, items: catItems }] of Object.entries(byCategory)) {
+    const mod = parseFloat(modifier);
+    console.log(`\n  ${catName}: priceModifier=${mod}`);
 
-    if (weight < BUY_BELOW) {
-      console.log(`  ${itemType.name}: ${weight} -> BUY (below ${BUY_BELOW})`);
-
-      // Drain whatever is currently in stock
-      for (const itemId of items) {
-        await buyUntilEmpty(itemId, itemType.name);
+    if (mod < BUY_BELOW) {
+      console.log(`    -> BUY all stock (below ${BUY_BELOW})`);
+      for (const item of catItems) {
+        await buyAllStock(item);
+        newRestockItems.push(item);  // watch for restocks
       }
-
-      // Then queue these items for the restock loop
-      for (const itemId of items) {
-        newActiveBuyItems.push({ itemId, label: itemType.name });
+    } else if (mod > SELL_ABOVE) {
+      console.log(`    -> SELL all (above ${SELL_ABOVE})`);
+      for (const item of catItems) {
+        await sellUntilEmpty(item.id, item.name);
       }
-
-    } else if (weight > SELL_ABOVE) {
-      console.log(`  ${itemType.name}: ${weight} -> SELL (above ${SELL_ABOVE})`);
-      for (const itemId of items) {
-        await sellUntilEmpty(itemId, itemType.name);
-      }
-
     } else {
-      console.log(`  ${itemType.name}: ${weight} (hold)`);
+      console.log(`    -> hold`);
     }
   }
 
-  // Update restock loop with whatever categories are currently cheap
-  activeBuyItems = newActiveBuyItems;
-  startRestockLoop(activeBuyItems);
+  restockItems = newRestockItems;
+  startRestockLoop(restockItems);
 }
 
-// ─── Schedule tick at :15 past each minute ───────────────────────────────────
+// ─── Scheduler — runs tick at :NN past each minute ───────────────────────────
 function scheduleNextTick() {
   const now     = new Date();
   const seconds = now.getSeconds();
   const ms      = now.getMilliseconds();
 
-  // How many ms until the next :15 mark
-  let waitMs;
-  if (seconds < 11) {
-    waitMs = (11 - seconds) * 1000 - ms;
-  } else {
-    waitMs = (71 - seconds) * 1000 - ms;  // next minute's :15
-  }
+  const waitMs = seconds < SECOND_OFFSET
+    ? (SECOND_OFFSET - seconds) * 1000 - ms
+    : (60 - seconds + SECOND_OFFSET) * 1000 - ms;
 
-  console.log(`[Scheduler] Next price check in ${(waitMs / 1000).toFixed(1)}s (at :15 past the minute)`);
+  console.log(`[Scheduler] Next price check in ${(waitMs / 1000).toFixed(1)}s (at :${String(SECOND_OFFSET).padStart(2, '0')})`);
 
   setTimeout(async () => {
     await tick();
-    // Schedule the one after that (every 60s from now at :15)
     setInterval(tick, 60 * 1000);
   }, waitMs);
 }
@@ -316,6 +257,8 @@ function scheduleNextTick() {
 async function main() {
   await login();
   setInterval(refreshBearer, TOKEN_REFRESH);
+  // Run immediately on start, then align to offset
+  await tick();
   scheduleNextTick();
 }
 
