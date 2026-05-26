@@ -2,13 +2,10 @@ const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
 // Usage: node bot.js --offset 11
-// --offset N  : seconds past each minute to run the price check (default: 11)
-const args         = process.argv.slice(2);
-const offsetFlag   = args.indexOf('--offset');
+const args          = process.argv.slice(2);
+const offsetFlag    = args.indexOf('--offset');
 const SECOND_OFFSET = offsetFlag !== -1 ? parseInt(args[offsetFlag + 1], 10) : 11;
-const SKIP_ITEM_IDS = new Set([
-  '695e6e0d-03b4-4812-94b5-411e88a81a22',  // Ancient Jedi Texts
-]);
+
 if (isNaN(SECOND_OFFSET) || SECOND_OFFSET < 0 || SECOND_OFFSET > 59) {
   console.error('Invalid --offset value. Must be 0-59.');
   process.exit(1);
@@ -18,9 +15,9 @@ console.log(`[Config] Price check offset: :${String(SECOND_OFFSET).padStart(2, '
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const GQL_ENDPOINT  = 'https://f2026-bagende.itmindsinternal.dk/graphql';
-const BUY_BELOW     = 0.80;   // buy when priceModifier is below this
-const SELL_ABOVE    = 1.20;   // sell when priceModifier is above this
-const TOKEN_REFRESH = 20 * 60 * 1000;
+const BUY_BELOW     = 0.85;
+const SELL_ABOVE    = 1.45;
+const TOKEN_REFRESH = 2 * 60 * 1000;
 
 const EMAIL    = process.env.WATTO_USER;
 const PASSWORD = process.env.WATTO_PASS;
@@ -31,10 +28,17 @@ if (!EMAIL || !PASSWORD) {
   process.exit(1);
 }
 
+// ─── Skip list — item IDs to never buy ───────────────────────────────────────
+const SKIP_ITEM_IDS = new Set([
+  // Add IDs here to skip buying them, e.g:
+  // '23c9ae29-7795-4bd1-8782-6c36893a28c1',
+]);
+
 // ─── State ────────────────────────────────────────────────────────────────────
 let token        = null;
+let userId       = null;
 let restockTimer = null;
-let restockItems = [];  // items to retry buying every 10s
+let restockItems = [];
 
 // ─── GQL helper ───────────────────────────────────────────────────────────────
 async function gql(query, variables = {}) {
@@ -63,10 +67,14 @@ async function login() {
     }),
   });
   const data = await res.json();
-  const t = data?.data?.login?.token;
-  if (!t) { console.error('[Auth] Login failed:', JSON.stringify(data?.errors ?? data)); process.exit(1); }
-  token = t;
-  console.log('[Auth] Logged in as', data.data.login.name);
+  const login = data?.data?.login;
+  if (!login?.token) {
+    console.error('[Auth] Login failed:', JSON.stringify(data?.errors ?? data));
+    process.exit(1);
+  }
+  token  = login.token;
+  userId = login.id;
+  console.log(`[Auth] Logged in as ${login.name} (userId: ${userId})`);
 }
 
 async function refreshBearer() {
@@ -82,7 +90,7 @@ async function refreshBearer() {
   else          { console.warn('[Auth] Refresh failed, re-logging in...'); await login(); }
 }
 
-// ─── Fetch all shop items with current prices and stock ───────────────────────
+// ─── Fetch all shop items ─────────────────────────────────────────────────────
 async function getShopItems() {
   const data = await gql(`
     query ShopItems {
@@ -104,8 +112,34 @@ async function getShopItems() {
   return data?.data?.items ?? [];
 }
 
-// ─── Buy one item (single unit) ───────────────────────────────────────────────
+// ─── Fetch inventory and return a map of { itemId -> quantity owned } ─────────
+async function getInventoryQuantities() {
+  const data = await gql(
+    `query userInventory($userId: String!) {
+      userItems(userId: $userId) {
+        itemId
+        item {
+          type { name }
+        }
+      }
+    }`,
+    { userId }
+  );
+
+  const counts = {};
+  for (const entry of data?.data?.userItems ?? []) {
+    counts[entry.itemId] = (counts[entry.itemId] ?? 0) + 1;
+  }
+  return counts;
+}
+
+// ─── Buy one unit of an item ──────────────────────────────────────────────────
 async function buyOne(itemId, itemName) {
+  if (SKIP_ITEM_IDS.has(itemId)) {
+    console.log(`    [buy] ${itemName}: skipped`);
+    return false;
+  }
+
   const data = await gql(
     `mutation BuyItem($itemId: ID!) {
       buyItem(itemId: $itemId) {
@@ -133,41 +167,42 @@ async function buyAllStock(item) {
     console.log(`    [buy] ${item.name}: skipped`);
     return;
   }
-  if (stock === 0) { console.log(`    [buy] ${name}: no stock`); return; }
+  if (item.stock === 0) { console.log(`    [buy] ${item.name}: no stock`); return; }
 
-  console.log(`    [buy] ${name}: buying ${stock} unit(s)`);
-  for (let i = 0; i < stock; i++) {
-    const ok = await buyOne(id, name);
+  console.log(`    [buy] ${item.name}: buying ${item.stock} unit(s)`);
+  for (let i = 0; i < item.stock; i++) {
+    const ok = await buyOne(item.id, item.name);
     if (!ok) break;
   }
 }
 
-// ─── Sell all of an item ──────────────────────────────────────────────────────
-async function sellUntilEmpty(itemId, itemName) {
-  let count = 0;
-  while (true) {
-    const data = await gql(
-      `mutation SellItem($itemId: ID!, $quantity: Int!, $sellTo: SellTarget!) {
-        sellItem(itemId: $itemId, quantity: $quantity, sellTo: $sellTo) {
-          payout
-          soldIds
-          newItemStock
-          marketListingId
-        }
-      }`,
-      { itemId, quantity: 1, sellTo: 'WATTO' }
-    );
-
-    if (data?.errors || !data?.data?.sellItem) {
-      const reason = data?.errors?.[0]?.message ?? 'unknown error';
-      console.log(`    [sell] ${itemName} stopped after ${count}: ${reason}`);
-      break;
-    }
-
-    count++;
-    const { payout, newItemStock } = data.data.sellItem;
-    console.log(`    [sell] ${itemName} #${count} payout: ${payout} (stock left: ${newItemStock})`);
+// ─── Sell exact quantity from inventory ───────────────────────────────────────
+async function sellFromInventory(itemId, itemName, quantity) {
+  if (!quantity || quantity === 0) {
+    console.log(`    [sell] ${itemName}: nothing in inventory`);
+    return;
   }
+
+  console.log(`    [sell] ${itemName}: selling ${quantity} from inventory`);
+
+  const data = await gql(
+    `mutation SellItem($itemId: ID!, $quantity: Int!, $sellTo: SellTarget!) {
+      sellItem(itemId: $itemId, quantity: $quantity, sellTo: $sellTo) {
+        payout
+        soldIds
+        newItemStock
+        marketListingId
+      }
+    }`,
+    { itemId, quantity, sellTo: 'WATTO' }
+  );
+
+  if (data?.errors || !data?.data?.sellItem) {
+    console.log(`    [sell] ${itemName} failed: ${data?.errors?.[0]?.message ?? 'unknown'}`);
+    return;
+  }
+
+  console.log(`    [sell] ${itemName} payout: ${data.data.sellItem.payout}`);
 }
 
 // ─── Restock loop: fires every 10s, buys 1 of each watched item ──────────────
@@ -203,7 +238,7 @@ async function tick() {
     return;
   }
 
-  // Group items by category and their modifier
+  // Group by category
   const byCategory = {};
   for (const item of items) {
     const cat = item.type.name;
@@ -221,12 +256,14 @@ async function tick() {
       console.log(`    -> BUY all stock (below ${BUY_BELOW})`);
       for (const item of catItems) {
         await buyAllStock(item);
-        newRestockItems.push(item);  // watch for restocks
+        newRestockItems.push(item);
       }
     } else if (mod > SELL_ABOVE) {
-      console.log(`    -> SELL all (above ${SELL_ABOVE})`);
+      console.log(`    -> SELL (above ${SELL_ABOVE})`);
+      const inventory = await getInventoryQuantities();
       for (const item of catItems) {
-        await sellUntilEmpty(item.id, item.name);
+        const qty = inventory[item.id] ?? 0;
+        await sellFromInventory(item.id, item.name, qty);
       }
     } else {
       console.log(`    -> hold`);
@@ -259,7 +296,6 @@ function scheduleNextTick() {
 async function main() {
   await login();
   setInterval(refreshBearer, TOKEN_REFRESH);
-  // Run immediately on start, then align to offset
   await tick();
   scheduleNextTick();
 }
