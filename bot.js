@@ -103,12 +103,30 @@ async function getShopItems() {
         type {
           id
           name
-          priceModifier
         }
       }
     }
   `);
   return data?.data?.items ?? [];
+}
+
+// ─── Fetch item type weights ──────────────────────────────────────────────
+async function getItemTypeWeights() {
+  const data = await gql(`
+    query ItemTypes {
+      itemTypes {
+        id
+        name
+        weight
+      }
+    }
+  `);
+  
+  const weights = {};
+  for (const type of data?.data?.itemTypes ?? []) {
+    weights[type.id] = type.weight;
+  }
+  return weights;
 }
 
 // ─── Fetch inventory and return a map of { itemId -> quantity owned } ─────────
@@ -237,32 +255,43 @@ async function tick() {
     return;
   }
 
+  let itemTypeWeights;
+  try {
+    itemTypeWeights = await getItemTypeWeights();
+  } catch (err) {
+    console.log('  Failed to fetch item type weights:', err.message);
+    await refreshBearer();
+    return;
+  }
+
   // Group by category
   const byCategory = {};
   for (const item of items) {
     const cat = item.type.name;
-    if (!byCategory[cat]) byCategory[cat] = { modifier: item.type.priceModifier, items: [] };
+    if (!byCategory[cat]) byCategory[cat] = { typeId: item.type.id, items: [] };
     byCategory[cat].items.push(item);
   }
 
   const newRestockItems = [];
 
-  for (const [catName, { modifier, items: catItems }] of Object.entries(byCategory)) {
-    const mod = parseFloat(modifier);
-    console.log(`\n  ${catName}: priceModifier=${mod}`);
+  for (const [catName, { typeId, items: catItems }] of Object.entries(byCategory)) {
+    const weight = itemTypeWeights[typeId] ?? 1.0;
+    console.log(`\n  ${catName}: weight=${weight}`);
 
-    if (mod < BUY_BELOW) {
+    if (weight < BUY_BELOW) {
       console.log(`    -> BUY all stock (below ${BUY_BELOW})`);
       for (const item of catItems) {
         await buyAllStock(item);
         newRestockItems.push(item);
       }
-    } else if (mod > SELL_ABOVE) {
+    } else if (weight > SELL_ABOVE) {
       console.log(`    -> SELL (above ${SELL_ABOVE})`);
       const inventory = await getInventoryQuantities();
       for (const item of catItems) {
         const qty = inventory[item.id] ?? 0;
-        await sellFromInventory(item.id, item.name, qty);
+        if (qty > 0) {
+          await sellFromInventory(item.id, item.name, qty);
+        }
       }
     } else {
       console.log(`    -> hold`);
