@@ -1,11 +1,10 @@
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const GQL_ENDPOINT  = 'https://f2026-bagende.itmindsinternal.dk//graphql';
-const BUY_BELOW     = 0.93;
-const SELL_ABOVE    = 1.23;
-const TICK_INTERVAL = 1 * 60 * 1000;  // check every 1 minute
-const WAIT_DELAY = 50;
+const GQL_ENDPOINT  = 'https://f2026-bagende.itmindsinternal.dk/graphql';
+const TOKEN_REFRESH = 2 * 60 * 1000;
+const CONFIG_REFRESH = 8 * 60 * 60 * 1000; // 8 hours
+
 const EMAIL    = process.env.WATTO_USER;
 const PASSWORD = process.env.WATTO_PASS;
 
@@ -15,117 +14,95 @@ if (!EMAIL || !PASSWORD) {
   process.exit(1);
 }
 
-// ─── Item registry ────────────────────────────────────────────────────────────
-// Maps itemType name -> list of individual item IDs we can buy/sell
-const ITEMS_BY_CATEGORY = {
-  'Navigation & Electronics': [
-    '51931257-a8ce-4504-9dbc-b3ea7911bdda',  // HOLOGRAPHIC NAV
-    'ce665896-47b1-45ad-a0ca-ed81f1b8c11a',  // NAV NAV
-  ],
-  'Podracer Parts': [
-    '35b70839-b24d-4985-b719-463fe281e053',  // IGNITION POD
-    'cb4f4ffb-d24f-44ed-b23f-b0c88f944e38',  // IGNITION POD
-    '4fd24482-26ff-49cc-ae9c-ecf9e18b33f4',  // IGNITION POD
-
-  ],
-  'Misc Junk': [
-    'ad9906f8-6e4f-4210-9288-0bb5edb6d4ff',  // HELMET
-    '54a19bae-d195-4395-be0f-b881a7e3eedd',  // INT-CHAIR
-  ],
-  'Droids': [
-    'd06e0479-bc0e-4615-9918-96f41fe61a18',  // PARTS
-    '5d426e2e-f908-4a79-855f-023a123e24fd',  // LEG
-    '1c575d71-c080-42fa-9a3d-8ed8523311ed',  // GONK
-    '52f60276-2f8a-4701-a7b7-88e494d6534d',  // HEAD
-  ],
-  'Rare Artifacts': [
-    'ecbd757f-db77-4ce6-b738-ee3f30042234', //SITH
-    '3751c92d-2397-4894-bb04-1feed04ccbd7', // BESKAR
-    '23c9ae29-7795-4bd1-8782-6c36893a28c1', //ANCIENT
-  ]
-};
+// ─── Bot Config ───────────────────────────────────────────────────────────────
+const ITEM_TYPE_IDS = [
+  'b7026116-bf27-43c0-95a6-dbbb0cc2448e',
+  '81aef75f-926b-42e0-a42b-c51f8f8a30fd',
+  '26debbaf-bfa5-47a8-9440-089e502b85c6',
+  'a6e9fb96-e881-4745-9c7e-15a3bef32a6c',
+  'ef9a6e78-ad86-44b1-af0c-4b8a3b5718c7'
+];
+const BUY_THRESHOLD  = 0.31;
+const SELL_THRESHOLD = 1.5;
 
 // ─── State ────────────────────────────────────────────────────────────────────
-let token = null;
+let token         = null;
+let userId        = null;
+let configTimer   = null;
 
-// ─── GraphQL helper ───────────────────────────────────────────────────────────
+// ─── GQL helper ───────────────────────────────────────────────────────────────
 async function gql(query, variables = {}) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-
   const res = await fetch(GQL_ENDPOINT, {
     method: 'POST',
-    headers,
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${token}`,
+    },
     body: JSON.stringify({ query, variables }),
   });
-
   return res.json();
 }
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+async function login() {
+  console.log('[Auth] Logging in as', EMAIL);
+  const res = await fetch(GQL_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: `mutation Login($email: String!, $password: String!) {
+        login(email: $email, password: $password) { id email token name }
+      }`,
+      variables: { email: EMAIL, password: PASSWORD },
+    }),
+  });
+  const data = await res.json();
+  const login = data?.data?.login;
+  if (!login?.token) {
+    console.error('[Auth] Login failed:', JSON.stringify(data?.errors ?? data));
+    process.exit(1);
+  }
+  token  = login.token;
+  userId = login.id;
+  console.log(`[Auth] Logged in as ${login.name} (userId: ${userId})`);
+}
+
 async function refreshBearer() {
   console.log('[Auth] Refreshing token...');
   const res = await fetch(GQL_ENDPOINT, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Cookie':       `refresh_token=${token}`,
-    },
+    headers: { 'Content-Type': 'application/json', 'Cookie': `refresh_token=${token}` },
     body: JSON.stringify({ query: 'mutation { refreshToken }' }),
   });
- 
   const data = await res.json();
   const newToken = data?.data?.refreshToken;
- 
-  if (newToken) {
-    token = newToken;
-    console.log('[Auth] Token refreshed');
-  } else {
-    console.warn('[Auth] Refresh failed, re-logging in...', JSON.stringify(data?.errors ?? data));
-    await login();
-  }
+  if (newToken) { token = newToken; console.log('[Auth] Token refreshed'); }
+  else          { console.warn('[Auth] Refresh failed, re-logging in...'); await login(); }
 }
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-async function login() {
-  console.log('[Auth] Logging in as', EMAIL);
-  const data = await gql(
-    `mutation Login($email: String!, $password: String!) {
-      login(email: $email, password: $password) {
+
+// ─── Fetch all shop items ─────────────────────────────────────────────────────
+async function getShopItems() {
+  const data = await gql(`
+    query ShopItems {
+      items {
         id
-        email
-        token
         name
+        basePrice
+        currentPrice
+        stock
+        maxStock
+        type {
+          id
+          name
+        }
       }
-    }`,
-    { email: EMAIL, password: PASSWORD }
-  );
-
-  const t = data?.data?.login?.token;
-  if (!t) {
-    console.error('[Auth] Login failed:', JSON.stringify(data?.errors ?? data));
-    process.exit(1);
-  }
-
-  token = t;
-  console.log('[Auth] Logged in as', data.data.login.name, '✓');
+    }
+  `);
+  return data?.data?.items ?? [];
 }
-async function refreshToken() {
-  console.log('[Auth] Refreshing token for', EMAIL);
-  const data = await gql(
-    `mutation  {
-      refreshToken
-    }`,
-  );
 
-  const t = data?.data?.login?.token;
-  if (!t) {
-    console.error('[Auth] Login failed:', JSON.stringify(data?.errors ?? data));
-    process.exit(1);
-  }
-
-  token = t;
-  console.log('[Auth] Logged in as', data.data.login.name, '✓');
-}
-// ─── Get item type weights ────────────────────────────────────────────────────
-async function getItemTypes() {
+// ─── Fetch item type weights ──────────────────────────────────────────────
+async function getItemTypeWeights() {
   const data = await gql(`
     query ItemTypes {
       itemTypes {
@@ -135,122 +112,197 @@ async function getItemTypes() {
       }
     }
   `);
-  return data?.data?.itemTypes ?? [];
-}
-
-// ─── Buy one item repeatedly until error ─────────────────────────────────────
-async function buyUntilEmpty(itemId, itemName) {
-  let count = 0;
-  while (true) {
-    const data = await gql(
-      `mutation BuyItem($itemId: ID!) {
-        buyItem(itemId: $itemId) {
-          id
-          purchasePrice
-          item { id stock currentPrice }
-        }
-      }`,
-      { itemId }
-    );
-
-    if (data?.errors || !data?.data?.buyItem) {
-      const reason = data?.errors?.[0]?.message ?? 'unknown error';
-      console.log(`    stopped buying ${itemName} after ${count}: ${reason}`);
-      break;
-    }
-
-    count++;
-    const { purchasePrice, item } = data.data.buyItem;
-    console.log(`    bought ${itemName} #${count} @ ${purchasePrice} (stock left: ${item.stock})`);
-    await new Promise(resolve => setTimeout(resolve, WAIT_DELAY));
-
-    // Stop if stock hits 0
-    if (item.stock === 0) {
-      console.log(`    ${itemName} out of stock`);
-      break;
-    }
-  }
-}
-
-// ─── Sell one item repeatedly until error ─────────────────────────────────────
-async function sellUntilEmpty(itemId, itemName) {
-  let count = 0;
-  while (true) {
-    const data = await gql(
-      `mutation SellItem($itemId: ID!, $quantity: Int!, $sellTo: SellTarget!) {
-        sellItem(itemId: $itemId, quantity: $quantity, sellTo: $sellTo) {
-          payout
-          soldIds
-          newItemStock
-          marketListingId
-        }
-      }`,
-      { itemId, quantity: 1, sellTo: 'WATTO' }
-    );
-
-    if (data?.errors || !data?.data?.sellItem) {
-      const reason = data?.errors?.[0]?.message ?? 'unknown error';
-      console.log(`    stopped selling ${itemName} after ${count}: ${reason}`);
-      if (reason.includes('Not authorized')) {
-        login().then(() => console.log('    re-logged in, will retry selling next tick'));
-      }
-      break;
-    }
-
-    count++;
-    const { payout, newItemStock } = data.data.sellItem;
-    console.log(`    sold ${itemName} #${count} payout: ${payout} (stock left: ${newItemStock})`);
-
-
-    await new Promise(resolve => setTimeout(resolve, WAIT_DELAY));
-
-  }
-}
-
-// ─── Main trading tick ────────────────────────────────────────────────────────
-async function tick() {
-  console.log(`\n[${new Date().toLocaleTimeString()}] Fetching item weights...`);
   
-  let itemTypes;
-  try {
-    itemTypes = await getItemTypes();
-    await refreshBearer();  // Refresh token after each successful fetch to stay logged in
-  } catch (err) {
-    console.log('  Failed to fetch items:', err.message, '— re-logging in...');
-    await login();
+  const weights = {};
+  for (const type of data?.data?.itemTypes ?? []) {
+    weights[type.id] = type.weight;
+  }
+  return weights;
+}
+
+// ─── Fetch inventory and return a map of { itemId -> quantity owned } ─────────
+async function getInventoryQuantities() {
+  const data = await gql(
+    `query userInventory($userId: String!) {
+      userItems(userId: $userId) {
+        itemId
+        item {
+          type { name }
+        }
+      }
+    }`,
+    { userId }
+  );
+
+  const counts = {};
+  for (const entry of data?.data?.userItems ?? []) {
+    counts[entry.itemId] = (counts[entry.itemId] ?? 0) + 1;
+  }
+  return counts;
+}
+
+// ─── Buy one unit of an item ──────────────────────────────────────────────────
+async function buyOne(itemId, itemName) {
+  const data = await gql(
+    `mutation BuyItem($itemId: ID!) {
+      buyItem(itemId: $itemId) {
+        id
+        purchasePrice
+        item { id stock }
+      }
+    }`,
+    { itemId }
+  );
+
+  if (data?.errors || !data?.data?.buyItem) {
+    console.log(`    [buy] ${itemName}: ${data?.errors?.[0]?.message ?? 'unknown error'}`);
+    return false;
+  }
+
+  const { purchasePrice, item } = data.data.buyItem;
+  console.log(`    [buy] ${itemName} @ ${purchasePrice} (stock left: ${item.stock})`);
+  return true;
+}
+
+// ─── Buy all available stock of an item ───────────────────────────────────────
+async function buyAllStock(item) {
+  if (item.stock === 0) { console.log(`    [buy] ${item.name}: no stock`); return; }
+
+  console.log(`    [buy] ${item.name}: buying ${item.stock} unit(s)`);
+  for (let i = 0; i < item.stock; i++) {
+    const ok = await buyOne(item.id, item.name);
+    if (!ok) break;
+  }
+}
+
+// ─── Sell exact quantity from inventory ───────────────────────────────────────
+async function sellFromInventory(itemId, itemName, quantity) {
+  if (!quantity || quantity === 0) {
+    console.log(`    [sell] ${itemName}: nothing in inventory`);
     return;
   }
 
-  for (const itemType of itemTypes) {
-    const weight = parseFloat(itemType.weight);
-    const items  = ITEMS_BY_CATEGORY[itemType.name];
+  console.log(`    [sell] ${itemName}: selling ${quantity} from inventory`);
 
-    if (!items) {
-      console.log(`  ${itemType.name}: ${weight} (no items configured, skipping)`);
-      continue;
-    }
+  const data = await gql(
+    `mutation SellItem($itemId: ID!, $quantity: Int!, $sellTo: SellTarget!) {
+      sellItem(itemId: $itemId, quantity: $quantity, sellTo: $sellTo) {
+        payout
+        soldIds
+        newItemStock
+        marketListingId
+      }
+    }`,
+    { itemId, quantity, sellTo: 'WATTO' }
+  );
 
-    if (weight < BUY_BELOW) {
-      console.log(`  ${itemType.name}: ${weight} -> BUYING (below ${BUY_BELOW})`);
-      for (const itemId of items) {
-        await buyUntilEmpty(itemId, itemType.name);
-      }
-    } else if (weight > SELL_ABOVE) {
-      console.log(`  ${itemType.name}: ${weight} -> SELLING (above ${SELL_ABOVE})`);
-      for (const itemId of items) {
-        await sellUntilEmpty(itemId, itemType.name);
-      }
-    } else {
-      console.log(`  ${itemType.name}: ${weight} (hold)`);
-    }
+  if (data?.errors || !data?.data?.sellItem) {
+    console.log(`    [sell] ${itemName} failed: ${data?.errors?.[0]?.message ?? 'unknown'}`);
+    return;
   }
+
+  console.log(`    [sell] ${itemName} payout: ${data.data.sellItem.payout}`);
+}
+
+// ─── Save bot config ──────────────────────────────────────────────────────────
+async function saveBotConfig() {
+  console.log('[Config] Saving bot configuration...');
+  
+  const data = await gql(
+    `mutation SaveBotConfig($itemTypeIds: [String!]!, $buyThreshold: Float!, $sellThreshold: Float!) {
+      saveBotConfig(
+        itemTypeIds: $itemTypeIds
+        buyThreshold: $buyThreshold
+        sellThreshold: $sellThreshold
+      ) {
+        isActive
+        itemTypeIds
+        buyThreshold
+        sellThreshold
+        startedAt
+        expiresAt
+      }
+    }`,
+    {
+      itemTypeIds: ITEM_TYPE_IDS,
+      buyThreshold: BUY_THRESHOLD,
+      sellThreshold: SELL_THRESHOLD
+    }
+  );
+
+  if (data?.errors || !data?.data?.saveBotConfig) {
+    console.log('[Config] Save failed:', data?.errors?.[0]?.message ?? 'unknown error');
+    return false;
+  }
+
+  const config = data.data.saveBotConfig;
+  console.log('[Config] Saved successfully');
+  console.log(`  isActive: ${config.isActive}`);
+  console.log(`  buyThreshold: ${config.buyThreshold}`);
+  console.log(`  sellThreshold: ${config.sellThreshold}`);
+  console.log(`  expiresAt: ${config.expiresAt}`);
+  return true;
+}
+
+// ─── Start bot ─────────────────────────────────────────────────────────────────
+async function startBot() {
+  console.log('[Bot] Starting bot...');
+  
+  const data = await gql(
+    `mutation StartBot {
+      startBot {
+        isActive
+        itemTypeIds
+        buyThreshold
+        sellThreshold
+        startedAt
+        expiresAt
+      }
+    }`
+  );
+
+  if (data?.errors || !data?.data?.startBot) {
+    console.log('[Bot] Start failed:', data?.errors?.[0]?.message ?? 'unknown error');
+    return false;
+  }
+
+  const config = data.data.startBot;
+  console.log('[Bot] Started successfully');
+  console.log(`  isActive: ${config.isActive}`);
+  console.log(`  startedAt: ${config.startedAt}`);
+  console.log(`  expiresAt: ${config.expiresAt}`);
+  return true;
+}
+
+// ─── Config loop: runs every 8 hours ───────────────────────────────────────────
+async function runConfigCycle() {
+  try {
+    const saved = await saveBotConfig();
+    if (!saved) return;
+
+    const started = await startBot();
+    if (!started) return;
+
+    console.log('[Config] Cycle complete. Next refresh in 8 hours.');
+  } catch (err) {
+    console.error('[Config] Error during cycle:', err.message);
+    await refreshBearer();
+  }
+
+  // Schedule next config refresh
+  if (configTimer) clearTimeout(configTimer);
+  configTimer = setTimeout(runConfigCycle, CONFIG_REFRESH);
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 async function main() {
+  console.log(`[${new Date().toLocaleTimeString()}] Bot starting...`);
+  
   await login();
-  await tick();
-  setInterval(tick, TICK_INTERVAL);
+  setInterval(refreshBearer, TOKEN_REFRESH);
+  
+  // Initial config cycle
+  await runConfigCycle();
 }
 
 main().catch(console.error);
